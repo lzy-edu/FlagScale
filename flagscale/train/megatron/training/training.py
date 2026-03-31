@@ -38,9 +38,11 @@ from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
+import json
 import logging
 import math
 import os
+import socket
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -255,6 +257,12 @@ from megatron.training import ft_integration
 from megatron.training.global_vars import get_spiky_loss_detector
 from megatron.training.peft import PEFT # Import PEFT from peft module
 from megatron.plugin.hetero.parallel_context import get_parallel_context
+from flagscale.train.perf_monitor.hooks import (
+    initialize_perf_monitor,
+    perf_monitor_end_iteration,
+    perf_monitor_end_training,
+    perf_monitor_start_iteration,
+)
 
 from megatron.plugin.platform import get_platform
 cur_platform = get_platform()
@@ -2972,6 +2980,7 @@ def train(
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
+    perf_callback = initialize_perf_monitor(args)
     pre_hook_enabled = False
     should_exit = False
     exit_code = 0
@@ -3004,6 +3013,7 @@ def train(
     num_microbatches = get_num_microbatches()
 
     ########## FlagScale Begin ##########
+    writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     if wandb_writer and args.wandb_log_model:
         # wandb.watch's log_freg needs to take the accumulated number of microbatches into account
@@ -3263,6 +3273,8 @@ def train(
             num_zeros_in_grad = 0
             max_attention_logit = None
         else:
+            if perf_callback is not None:
+                perf_monitor_start_iteration(iteration)
             ft_integration.on_training_step_start()
             (
                 loss_dict,
@@ -3277,6 +3289,9 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            
+            if perf_callback is not None:
+                perf_monitor_end_iteration(iteration, writer, wandb_writer)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3554,6 +3569,7 @@ def train(
 
     # Flush TensorBoard, WandB writers and one-logger.
     writer = get_tensorboard_writer()
+    perf_monitor_end_training(writer, wandb_writer)
     if writer:
         writer.flush()
 
