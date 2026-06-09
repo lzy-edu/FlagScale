@@ -43,6 +43,7 @@ class SectionContext:
             torch.cuda.synchronize()
             self.cuda_end_event = torch.cuda.Event(enable_timing=True)
             self.cuda_end_event.record()
+            self.cuda_end_event.synchronize()
             cuda_elapsed = self.cuda_start_event.elapsed_time(self.cuda_end_event) / 1000.0
 
         if hasattr(self.detector, "record_section"):

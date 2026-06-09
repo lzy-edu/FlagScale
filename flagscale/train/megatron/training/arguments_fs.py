@@ -1044,7 +1044,6 @@ def add_flagscale_arguments(parser):
     parser = _add_auto_tuner_args(parser)
     parser = _add_auto_skip_spiky_loss(parser)
     parser = _add_peft_args(parser)
-    parser = _add_regularization_args(parser)
     parser = _add_straggler_args(parser)
     parser = _add_flagos_args(parser)
     parser = _add_flagscale_specific_args(parser)
