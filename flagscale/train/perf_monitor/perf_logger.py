@@ -29,6 +29,7 @@ class PerfMonitorLogger:
             pass
 
         self.enabled = self.rank == 0
+        self.json_data = []
         if not self.enabled:
             return
 
@@ -56,7 +57,6 @@ class PerfMonitorLogger:
                 console_handler.setFormatter(logging.Formatter("%(message)s"))
                 self.logger.addHandler(console_handler)
 
-        self.json_data = []
         self._write_header()
 
     def _write_header(self):
