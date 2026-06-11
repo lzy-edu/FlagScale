@@ -50,7 +50,11 @@ class StragglerDetector:
             step = self.current_step
         if name not in self.config.monitor_sections:
             return
-        self.section_timings[name].append((step, cpu_time, gpu_time))
+        timings = self.section_timings[name]
+        timings.append((step, cpu_time, gpu_time))
+        sample_size = self.config.sample_size
+        if sample_size and sample_size > 0 and len(timings) > sample_size:
+            del timings[: len(timings) - sample_size]
 
     def increment_step(self):
         self.current_step += 1
@@ -142,7 +146,7 @@ class StragglerDetector:
         if not TORCH_DISTRIBUTED_AVAILABLE or not dist.is_initialized():
             result = {}
             for section_name in self.config.monitor_sections:
-                avg_time = self.get_recent_section_time(section_name, num_samples=5)
+                avg_time = self.get_recent_section_time(section_name, num_samples=self.config.sample_size)
                 if avg_time is not None:
                     result[section_name] = {self.rank: avg_time}
             return result
@@ -150,7 +154,7 @@ class StragglerDetector:
         device = self._get_collective_device()
         result = {}
         for section_name in self.config.monitor_sections:
-            avg_time = self.get_recent_section_time(section_name, num_samples=5)
+            avg_time = self.get_recent_section_time(section_name, num_samples=self.config.sample_size)
             local_time = avg_time if avg_time is not None else -1.0
             local_tensor = torch.tensor([local_time], dtype=torch.float64, device=device)
             gathered_tensors = [

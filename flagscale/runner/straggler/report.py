@@ -93,11 +93,13 @@ class StragglerReport:
         for _, rank_scores in self.section_scores.items():
             if not rank_scores:
                 continue
-            fastest_rank, fastest_score = max(rank_scores.items(), key=lambda item: item[1])
-            for rank, score in rank_scores.items():
+            fastest_rank, fastest_time = min(rank_scores.items(), key=lambda item: item[1])
+            for rank, elapsed_time in rank_scores.items():
                 if rank == fastest_rank:
                     continue
-                relative_slowdown = fastest_score / score if score > 0 else float("inf")
+                if fastest_time <= 0:
+                    continue
+                relative_slowdown = elapsed_time / fastest_time
                 if relative_slowdown >= threshold and rank not in stragglers:
                     stragglers.append(rank)
 

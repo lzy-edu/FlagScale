@@ -78,6 +78,22 @@ class TestStragglerReport:
         )
         assert "Slowdown" in report.to_text()
 
+    def test_identify_stragglers_treats_section_scores_as_timings(self):
+        report = StragglerReport(
+            step=100,
+            section_scores={"forward_backward": {0: 0.100, 1: 0.210, 2: 0.110}},
+        )
+
+        assert report.identify_stragglers(threshold=2.0) == [1]
+
+    def test_identify_gpu_stragglers_treats_higher_scores_as_faster(self):
+        report = StragglerReport(
+            step=100,
+            gpu_scores={0: 10.0, 1: 4.0, 2: 9.0},
+        )
+
+        assert report.identify_gpu_stragglers(threshold=2.0) == [1]
+
     def test_timestamp_is_set(self):
         report = StragglerReport(step=100)
         report.timestamp = 1234567890.0

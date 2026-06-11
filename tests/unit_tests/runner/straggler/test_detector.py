@@ -75,6 +75,28 @@ class TestStragglerDetector:
         detector.record_section("forward_backward", cpu_time=0.5)
         assert len(detector.section_timings) == 0
 
+    def test_record_section_keeps_recent_sample_window(self, default_config):
+        default_config.sample_size = 3
+        detector = StragglerDetector(config=default_config, rank=0, world_size=1)
+
+        for step in range(5):
+            detector.record_section("forward_backward", cpu_time=float(step), step=step)
+
+        assert detector.section_timings["forward_backward"] == [
+            (2, 2.0, None),
+            (3, 3.0, None),
+            (4, 4.0, None),
+        ]
+
+    def test_record_section_allows_unbounded_window_when_sample_size_zero(self, default_config):
+        default_config.sample_size = 0
+        detector = StragglerDetector(config=default_config, rank=0, world_size=1)
+
+        for step in range(5):
+            detector.record_section("forward_backward", cpu_time=float(step), step=step)
+
+        assert len(detector.section_timings["forward_backward"]) == 5
+
     def test_should_profile(self, detector):
         for step in range(10):
             detector.current_step = step
@@ -196,6 +218,20 @@ class TestStragglerDetectorReportGeneration:
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+    @patch("flagscale.runner.straggler.detector.dist")
+    def test_gather_section_times_uses_configured_sample_size(self, mock_dist, detector):
+        mock_dist.is_initialized.return_value = False
+        detector.config.sample_size = 2
+        for idx in range(4):
+            detector.record_section("forward_backward", cpu_time=float(idx + 1), step=idx)
+
+        result = detector._gather_section_times_across_ranks()
+
+        assert result == {
+            "forward_backward": {0: pytest.approx(3.5)},
+        }
+
 
 
 class TestStragglerDetectorWithMockedDistributed:

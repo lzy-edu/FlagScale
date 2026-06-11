@@ -330,6 +330,14 @@ def _save_straggler_report(report, log_dir: Optional[str], iteration: int):
 
     print(f"\n{report.to_text()}")
 
+
+def _is_global_rank_zero() -> bool:
+    """Return True only on global rank 0, or in non-distributed execution."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
@@ -2017,10 +2025,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
     fs_straggler = get_fs_straggler_detector()
+    straggler_step = iteration
+    if straggler_step is None and fs_straggler is not None:
+        straggler_step = fs_straggler.current_step + 1
     should_profile_straggler = (
         fs_straggler is not None
         and fs_straggler.is_enabled()
-        and fs_straggler.should_profile(fs_straggler.current_step + 1)
+        and straggler_step is not None
+        and fs_straggler.should_profile(straggler_step)
     )
     profile_cuda = getattr(args, "straggler_enable_gpu_profile", True)
 
@@ -3503,7 +3515,7 @@ def train(
             fs_straggler.increment_step()
             if fs_straggler.should_report(iteration):
                 report = fs_straggler.generate_report(step=iteration)
-                if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                if _is_global_rank_zero():
                     _save_straggler_report(report, getattr(args, "straggler_log_dir", None), iteration)
 
         # Evaluation.

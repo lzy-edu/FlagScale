@@ -32,6 +32,12 @@ class TestNetworkHealthChecker:
         results = checker.measure_latency(["192.168.1.1"])
         assert results["192.168.1.1"] == float("inf")
 
+    @patch("subprocess.run")
+    def test_measure_latency_parse_failure_stays_infinite(self, mock_run, checker):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ping succeeded without avg line")
+        results = checker.measure_latency(["192.168.1.1"])
+        assert results["192.168.1.1"] == float("inf")
+
     def test_identify_unhealthy_nodes(self, checker):
         unhealthy = checker.identify_unhealthy_nodes(
             {

@@ -58,7 +58,7 @@ class NetworkHealthChecker:
                     if len(parts) >= 5:
                         avg_latency = float(parts[4])
                         break
-                latencies[ip] = avg_latency if avg_latency != float("inf") else 0.0
+                latencies[ip] = avg_latency
             except Exception:
                 latencies[ip] = float("inf")
         return latencies
