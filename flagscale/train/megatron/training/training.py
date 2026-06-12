@@ -38,11 +38,9 @@ from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
-import json
 import logging
 import math
 import os
-import socket
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -3304,7 +3302,6 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
-            
             if perf_callback is not None:
                 perf_monitor_end_iteration(iteration, writer, wandb_writer)
         if should_checkpoint:

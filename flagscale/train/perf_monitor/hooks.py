@@ -41,5 +41,7 @@ def perf_monitor_end_iteration(iteration, writer=None, wandb_writer=None):
 
 
 def perf_monitor_end_training(writer=None, wandb_writer=None):
+    global _perf_monitor_callback
     if _perf_monitor_callback is not None:
         _perf_monitor_callback.on_train_end(writer, wandb_writer)
+        _perf_monitor_callback = None

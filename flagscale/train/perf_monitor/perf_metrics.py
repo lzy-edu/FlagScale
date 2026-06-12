@@ -61,10 +61,12 @@ class ModelFLOPSCalculator:
         return "gpt"
 
     def _get_batch_size(self):
+        num_micro_batches = getattr(self.args, "num_micro_batches", 1)
         if get_num_microbatches is not None:
-            num_micro_batches = get_num_microbatches()
-        else:
-            num_micro_batches = getattr(self.args, "num_micro_batches", 1)
+            try:
+                num_micro_batches = get_num_microbatches()
+            except AttributeError:
+                pass
         micro_batch_size = getattr(self.args, "micro_batch_size", 1)
         return max(1, micro_batch_size * num_micro_batches)
 
@@ -293,5 +295,6 @@ class FLOPSMeasurementCallback:
                 else 0.0,
                 "max_step_time_ms": metrics.max_step_time * 1000,
                 "peak_memory_gb": self.monitor.peak_memory_gb,
-            }
+            },
+            total_iterations=len(self.monitor.step_times),
         )

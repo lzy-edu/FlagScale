@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,3 +53,6 @@ def test_perf_monitor_smoke_writes_summary(tmp_path):
 
     assert realtime_log.exists()
     assert summary_files
+
+    summary = json.loads(summary_files[0].read_text())
+    assert summary["session_info"]["total_iterations"] == 4

@@ -114,7 +114,7 @@ class PerfMonitorLogger:
             lines.append(f"  {key}: {value / 1e12:.2f} TFLOPS")
         self.logger.info("\n".join(lines))
 
-    def save_summary(self, final_stats=None):
+    def save_summary(self, final_stats=None, total_iterations=None):
         if not self.enabled:
             return
 
@@ -122,7 +122,9 @@ class PerfMonitorLogger:
             "session_info": {
                 "start_time": self.session_timestamp,
                 "end_time": datetime.now().astimezone().isoformat(),
-                "total_iterations": len(self.json_data),
+                "total_iterations": (
+                    total_iterations if total_iterations is not None else len(self.json_data)
+                ),
             },
             "final_statistics": final_stats or {},
             "iteration_logs": self.json_data,
