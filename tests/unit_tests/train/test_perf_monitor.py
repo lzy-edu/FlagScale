@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+dist = pytest.importorskip("torch.distributed")
 
 from flagscale.train.perf_monitor.hooks import (
     initialize_perf_monitor,
@@ -50,6 +51,12 @@ def test_perf_monitor_smoke_writes_summary(tmp_path):
 
     realtime_log = Path(tmp_path) / "perf_realtime.log"
     summary_files = list(Path(tmp_path).glob("perf_summary_*.json"))
+
+    is_rank0 = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+    if not is_rank0:
+        assert not realtime_log.exists()
+        assert not summary_files
+        return
 
     assert realtime_log.exists()
     assert summary_files
