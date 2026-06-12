@@ -233,7 +233,6 @@ class TestStragglerDetectorReportGeneration:
         }
 
 
-
 class TestStragglerDetectorWithMockedDistributed:
     @pytest.mark.skipif(detector_module.torch is None, reason="torch is not installed")
     @patch("flagscale.runner.straggler.detector.dist")
