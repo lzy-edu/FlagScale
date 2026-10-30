@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#if defined(FLAGSCALE_TRACE_USE_RCCL)
+#include <rccl.h>
+using ProbeStream_t = hipStream_t;
+#else
 #include <nccl.h>
+using ProbeStream_t = cudaStream_t;
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -453,7 +459,7 @@ struct CallContext {
 
 CallContext BeginCall(const char* api, ncclComm_t comm, std::size_t count,
                       ncclDataType_t datatype, int op, int root,
-                      cudaStream_t stream) noexcept {
+                      ProbeStream_t stream) noexcept {
   try {
     Runtime& runtime = Runtime::Instance();
     Event event = MakeBaseEvent(EventKind::kNcclCall, api, "enter");
@@ -478,7 +484,7 @@ CallContext BeginCall(const char* api, ncclComm_t comm, std::size_t count,
 
 void EndCall(const char* api, const CallContext& context, ncclResult_t result,
              std::size_t count, ncclDataType_t datatype, int op, int root,
-             cudaStream_t stream) noexcept {
+             ProbeStream_t stream) noexcept {
   try {
     Runtime& runtime = Runtime::Instance();
     Event event = MakeBaseEvent(EventKind::kNcclCall, api, "exit");
@@ -524,15 +530,21 @@ Function LoadNext(const char* name) {
   void* symbol = ::dlsym(RTLD_NEXT, name);
   if (symbol != nullptr) return reinterpret_cast<Function>(symbol);
 
-  // PyTorch commonly opens its bundled NCCL with RTLD_LOCAL. Such symbols are not
+  // PyTorch commonly opens its bundled NCCL/RCCL with RTLD_LOCAL. Such symbols are not
   // visible through RTLD_NEXT even though libtorch can call our preloaded wrapper.
   // Resolve directly from the NCCL handle in that case.
   static void* nccl_handle = []() noexcept -> void* {
-    void* handle = ::dlopen("libnccl.so.2", RTLD_LAZY | RTLD_NOLOAD);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so.2", RTLD_LAZY | RTLD_LOCAL);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so", RTLD_LAZY | RTLD_LOCAL);
-    return handle;
+#if defined(FLAGSCALE_TRACE_USE_RCCL)
+    const char* libraries[] = {"librccl.so.1", "librccl.so"};
+#else
+    const char* libraries[] = {"libnccl.so.2", "libnccl.so"};
+#endif
+    for (const int flags : {RTLD_LAZY | RTLD_NOLOAD, RTLD_LAZY | RTLD_LOCAL}) {
+      for (const char* library : libraries) {
+        if (void* handle = ::dlopen(library, flags)) return handle;
+      }
+    }
+    return nullptr;
   }();
   if (nccl_handle == nullptr) return nullptr;
   return reinterpret_cast<Function>(::dlsym(nccl_handle, name));
@@ -610,9 +622,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclCommDestroy(ncclComm_t comm) {
 FLAGSCALE_EXPORT ncclResult_t ncclAllReduce(const void* send_buffer, void* receive_buffer,
                                             size_t count, ncclDataType_t datatype,
                                             ncclRedOp_t op, ncclComm_t comm,
-                                            cudaStream_t stream) {
+                                            ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclAllReduce");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclAllReduce", comm, count, datatype,
@@ -626,9 +638,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclAllReduce(const void* send_buffer, void* recei
 
 FLAGSCALE_EXPORT ncclResult_t ncclAllGather(const void* send_buffer, void* receive_buffer,
                                             size_t send_count, ncclDataType_t datatype,
-                                            ncclComm_t comm, cudaStream_t stream) {
+                                            ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclComm_t, cudaStream_t);
+                                    ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclAllGather");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =
@@ -642,9 +654,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclAllGather(const void* send_buffer, void* recei
 FLAGSCALE_EXPORT ncclResult_t ncclReduceScatter(const void* send_buffer,
                                                 void* receive_buffer, size_t receive_count,
                                                 ncclDataType_t datatype, ncclRedOp_t op,
-                                                ncclComm_t comm, cudaStream_t stream) {
+                                                ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclReduceScatter");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclReduceScatter", comm, receive_count,
@@ -658,9 +670,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclReduceScatter(const void* send_buffer,
 
 FLAGSCALE_EXPORT ncclResult_t ncclBroadcast(const void* send_buffer, void* receive_buffer,
                                             size_t count, ncclDataType_t datatype, int root,
-                                            ncclComm_t comm, cudaStream_t stream) {
+                                            ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, int,
-                                    ncclComm_t, cudaStream_t);
+                                    ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclBroadcast");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =
@@ -674,9 +686,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclBroadcast(const void* send_buffer, void* recei
 FLAGSCALE_EXPORT ncclResult_t ncclReduce(const void* send_buffer, void* receive_buffer,
                                          size_t count, ncclDataType_t datatype,
                                          ncclRedOp_t op, int root, ncclComm_t comm,
-                                         cudaStream_t stream) {
+                                         ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, int, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, int, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclReduce");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclReduce", comm, count, datatype,
