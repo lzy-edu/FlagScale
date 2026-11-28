@@ -290,6 +290,7 @@ class TraceAnalyzer:
         now_unix_ns: int,
         hardware_health: Any | None = None,
         inspector: Any | None = None,
+        trace_source_issues: dict[tuple[int, int], tuple[str, ...]] | None = None,
     ) -> list[Finding]:
         findings: list[Finding] = []
         if self.detect_heartbeat_timeouts:
@@ -359,17 +360,20 @@ class TraceAnalyzer:
                 elapsed_s=elapsed_s,
                 detection_phase=detection_phase,
                 timeout_s=timeout_s,
+                trace_source_issues=trace_source_issues,
             )
             self._emit_once(("collective_missing_enter", *key), missing, findings)
 
         for key in completed_rounds:
             self._rounds.pop(key, None)
 
+        p2p_findings: list[Finding] = []
         self._scan_p2p(
             now_monotonic_s=now_monotonic_s,
             now_unix_ns=now_unix_ns,
-            output=findings,
+            output=p2p_findings,
         )
+        findings.extend(self._coalesce_missing_p2p_findings(p2p_findings))
         self._scan_single_missing_exits(
             now_monotonic_s=now_monotonic_s,
             now_unix_ns=now_unix_ns,
@@ -722,7 +726,14 @@ class TraceAnalyzer:
         now_unix_ns: int,
         output: list[Finding],
     ) -> None:
-        for key, direction in list(self._p2p_calls.items()):
+        directions = sorted(
+            self._p2p_calls.items(),
+            key=lambda item: min(
+                (call.effective_seen_monotonic_s for call in item[1].calls.values()),
+                default=now_monotonic_s,
+            ),
+        )
+        for key, direction in directions:
             for call in list(direction.calls.values()):
                 event = call.event
                 event_id = _p2p_event_id(event)
@@ -784,6 +795,9 @@ class TraceAnalyzer:
                             "local_group_id": _as_int(event.get("group_id"), default=0),
                             "local_group_op_index": _as_int(event.get("group_op_index"), default=0),
                             "local_p2p_op_index": _as_int(event.get("p2p_op_index"), default=-1),
+                            "_event_timestamp_unix_ns": _as_int(
+                                event.get("timestamp_unix_ns"), default=0
+                            ),
                             "waited_s": max(0.0, age_s),
                             "reason": "counterpart_not_observed_in_match_window",
                             "clock_assumption": "hosts have synchronized wall clocks",
@@ -879,6 +893,100 @@ class TraceAnalyzer:
         # the candidate indexes.
         self._seen_p2p_ids.difference_update(self._resolved_p2p_ids)
         self._resolved_p2p_ids.clear()
+
+    @staticmethod
+    def _coalesce_missing_p2p_findings(findings: list[Finding]) -> list[Finding]:
+        """Combine a burst of missing calls on one P2P link into one finding."""
+        grouped: dict[tuple[str, str, int, int], list[Finding]] = {}
+        output: list[Finding] = []
+
+        for finding in findings:
+            if finding.hang_type != "p2p_missing_counterpart":
+                output.append(finding)
+                continue
+            src_rank = _as_int(finding.details.get("src_comm_rank"), default=-1)
+            dst_rank = _as_int(finding.details.get("dst_comm_rank"), default=-1)
+            low_rank, high_rank = sorted((src_rank, dst_rank))
+            key = (finding.run_id, finding.comm_uid_hash, low_rank, high_rank)
+            grouped.setdefault(key, []).append(finding)
+
+        coalesced: list[tuple[int, Finding]] = []
+        for group in grouped.values():
+            primary = min(
+                group,
+                key=lambda finding: (
+                    _as_int(
+                        finding.details.get("_event_timestamp_unix_ns"),
+                        default=0,
+                    ),
+                    finding.comm_seq,
+                ),
+            )
+            details = dict(primary.details)
+            primary_timestamp_ns = _as_int(
+                details.pop("_event_timestamp_unix_ns", None),
+                default=0,
+            )
+
+            if len(group) > 1:
+                comm_seqs = sorted(finding.comm_seq for finding in group)
+                operation_indexes = sorted(
+                    index
+                    for finding in group
+                    if (
+                        index := _as_int(
+                            finding.details.get("local_p2p_op_index"),
+                            default=-1,
+                        )
+                    )
+                    >= 0
+                )
+                directions = sorted(
+                    {
+                        (
+                            _as_int(finding.details.get("src_comm_rank"), default=-1),
+                            _as_int(finding.details.get("dst_comm_rank"), default=-1),
+                            str(finding.details.get("observed_api", "")),
+                        )
+                        for finding in group
+                    }
+                )
+                details.update(
+                    {
+                        "aggregated_missing_call_count": len(group),
+                        "comm_seq_range": [comm_seqs[0], comm_seqs[-1]],
+                        "affected_directions": [
+                            {
+                                "src_comm_rank": src_rank,
+                                "dst_comm_rank": dst_rank,
+                                "observed_api": api,
+                            }
+                            for src_rank, dst_rank, api in directions
+                        ],
+                    }
+                )
+                if operation_indexes:
+                    details["local_p2p_op_index_range"] = [
+                        operation_indexes[0],
+                        operation_indexes[-1],
+                    ]
+
+            coalesced.append(
+                (
+                    primary_timestamp_ns,
+                    Finding(
+                        hang_type=primary.hang_type,
+                        run_id=primary.run_id,
+                        comm_uid_hash=primary.comm_uid_hash,
+                        comm_seq=primary.comm_seq,
+                        detected_at_unix_ns=primary.detected_at_unix_ns,
+                        details=details,
+                    ),
+                )
+            )
+
+        output.extend(finding for _, finding in sorted(coalesced, key=lambda item: item[0]))
+        return output
 
     def _add_p2p_call(self, direction: _P2PDirection, call: _P2PCall) -> None:
         event = call.event
@@ -1200,22 +1308,23 @@ class TraceAnalyzer:
         elapsed_s: float,
         detection_phase: str,
         timeout_s: float,
+        trace_source_issues: dict[tuple[int, int], tuple[str, ...]] | None,
     ) -> Finding:
         entered = sorted(collective.enters)
         missing = sorted(set(range(collective.expected_nranks)) - set(entered))
         members = self._comm_members.get((collective.run_id, collective.comm_uid_hash), {})
         rank_status: list[dict[str, Any]] = []
         known_states: list[str] = []
-        trace_event_loss_possible = False
+        source_states: list[str] = []
         for comm_rank in missing:
             global_rank = members.get(comm_rank)
             status: dict[str, Any] = {"comm_rank": comm_rank, "rank": global_rank}
             heartbeat = self._heartbeats.get(global_rank) if global_rank is not None else None
-            probe_status = self._probe_status.get(global_rank) if global_rank is not None else None
-            dropped_events = _as_int(
-                probe_status.get("dropped_events") if probe_status else 0, default=0
+            source = self._trace_source_status(
+                global_rank,
+                trace_source_issues=trace_source_issues,
             )
-            trace_event_loss_possible = trace_event_loss_possible or dropped_events > 0
+            source_states.append(str(source["status"]))
             if heartbeat is None:
                 status["heartbeat"] = "unknown"
             else:
@@ -1229,21 +1338,35 @@ class TraceAnalyzer:
                     }
                 )
                 known_states.append(state)
-            status["probe_dropped_events"] = dropped_events
+            status["probe_dropped_events"] = source["dropped_events"]
+            status["trace_source"] = source
             rank_status.append(status)
 
-        if trace_event_loss_possible:
+        if "unavailable" in source_states:
+            source_coverage = "insufficient"
+            reason = "trace_source_unavailable"
+            confidence = "unknown"
+        elif "incomplete" in source_states:
+            source_coverage = "insufficient"
+            reason = "trace_source_incomplete"
+            confidence = "unknown"
+        elif "lossy" in source_states:
+            source_coverage = "degraded"
             reason = "probe_event_loss_possible"
             confidence = "suspected"
-        elif "stale" in known_states:
-            reason = "rank_exit_or_crash_suspected"
-            confidence = "suspected"
-        elif known_states and all(state == "alive" for state in known_states):
-            reason = "rank_alive_but_not_entered"
-            confidence = "observed"
         else:
-            reason = "missing_rank_status_unknown"
-            confidence = "observed"
+            source_coverage = "sufficient"
+            if "stale" in known_states:
+                reason = "rank_exit_or_crash_suspected"
+                confidence = "suspected"
+            elif known_states and all(state == "alive" for state in known_states):
+                reason = "rank_alive_but_not_entered"
+                confidence = "observed"
+            else:
+                reason = "missing_rank_status_unknown"
+                confidence = "observed"
+
+        trace_event_loss_possible = source_coverage != "sufficient"
 
         first_event = next(iter(collective.enters.values()))
         return Finding(
@@ -1264,9 +1387,76 @@ class TraceAnalyzer:
                 "threshold_reason": self._threshold_reason(detection_phase),
                 "reason": reason,
                 "confidence": confidence,
+                "trace_source_coverage": source_coverage,
                 "trace_event_loss_possible": trace_event_loss_possible,
             },
         )
+
+    def _trace_source_status(
+        self,
+        global_rank: int | None,
+        *,
+        trace_source_issues: dict[tuple[int, int], tuple[str, ...]] | None,
+    ) -> dict[str, Any]:
+        """Describe whether absence of a trace event is usable evidence."""
+
+        issues: list[str] = []
+        if global_rank is None:
+            return {
+                "status": "unavailable",
+                "pid": None,
+                "dropped_events": 0,
+                "issues": ["communicator_rank_not_mapped"],
+            }
+
+        process = self._processes.get(global_rank)
+        probe_status = self._probe_status.get(global_rank)
+        process_pid = _as_int(process.event.get("pid"), default=-1) if process is not None else -1
+        status_pid = (
+            _as_int(probe_status.get("pid"), default=-1) if probe_status is not None else -1
+        )
+        if process is None:
+            issues.append("process_start_not_observed")
+        if probe_status is None:
+            issues.append("probe_status_not_observed")
+        if process_pid >= 0 and status_pid >= 0 and process_pid != status_pid:
+            issues.append("probe_status_pid_mismatch")
+
+        pid = process_pid if process_pid >= 0 else status_pid
+        if trace_source_issues is not None and pid >= 0:
+            source_key = (global_rank, pid)
+            if source_key not in trace_source_issues:
+                issues.append("trace_file_not_observed")
+            else:
+                issues.extend(trace_source_issues[source_key])
+
+        dropped_events = _as_int(
+            probe_status.get("dropped_events") if probe_status else 0,
+            default=0,
+        )
+        unavailable_issues = {
+            "process_start_not_observed",
+            "probe_status_not_observed",
+            "probe_status_pid_mismatch",
+            "trace_file_not_observed",
+        }
+        if unavailable_issues.intersection(issues):
+            source_status = "unavailable"
+        elif issues:
+            source_status = "incomplete"
+        elif dropped_events > 0:
+            source_status = "lossy"
+        else:
+            # This proves that the source was loaded and that the collector has
+            # observed no concrete loss signal. It intentionally does not claim
+            # continuous writer liveness.
+            source_status = "available"
+        return {
+            "status": source_status,
+            "pid": pid if pid >= 0 else None,
+            "dropped_events": dropped_events,
+            "issues": sorted(set(issues)),
+        }
 
     def _collective_detection_phase(self, collective: _CollectiveRound) -> str:
         """Return a stable phase for one collective round.

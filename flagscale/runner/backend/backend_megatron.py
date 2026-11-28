@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import os
+from dataclasses import replace
 from datetime import datetime
 
 from omegaconf import DictConfig, OmegaConf
 
 from flagscale.runner.backend.backend_base import BackendBase
 from flagscale.runner.diagnostics import (
-    active_run_id_cleanup_lines,
     active_run_id_file,
     active_run_id_setup_lines,
     diagnostic_command_body,
@@ -37,6 +37,7 @@ from flagscale.runner.tracing.config import (
     TraceLaunchConfig,
     prepare_trace_launch_config,
 )
+from flagscale.runner.training_process import stop_shell_lines, tracked_command_body
 from flagscale.runner.utils import get_pkg_dir, logger, parse_hostfile, resolve_path
 
 PERF_MONITOR_RUNNER_KEYS = (
@@ -146,6 +147,9 @@ class MegatronBackend(BackendBase):
         )
         host_pid_file = os.path.join(logging_config.pids_dir, f"host_{node_rank}_{host}.pid")
 
+        self.trace_config = replace(
+            self.trace_config, training_state_file=host_pid_file + ".training.json"
+        )
         os.makedirs(logging_config.scripts_dir, exist_ok=True)
         pkg_dir = (
             get_pkg_dir()
@@ -224,7 +228,9 @@ class MegatronBackend(BackendBase):
                 self.trace_config,
                 active_run_id_path=(self.active_run_id_file if self.publish_active_run_id else ""),
                 active_run_id=(self.diagnostics_run_id if self.publish_active_run_id else ""),
+                stop_requested_path=host_pid_file + ".training.json.stop_requested",
             )
+            command_body = tracked_command_body(command_body, host_pid_file)
             if background:
                 f.write(
                     f'nohup bash -c "{command_body}" >> {host_output_file} 2>&1 & echo $! > {host_pid_file}\n'
@@ -260,26 +266,39 @@ class MegatronBackend(BackendBase):
             after_stop = ""
         with open(host_stop_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
+            for line in self.trace_config.stop_evidence_lines(node_rank, "stop_requested"):
+                f.write(f"{line}\n")
             for line in self.heartbeat_config.stop_shell_lines(node_rank):
                 f.write(f"{line}\n")
-            for line in self.trace_config.stop_shell_lines(node_rank):
+            for line in self.trace_config.stop_evidence_lines(node_rank, "worker_stop_started"):
                 f.write(f"{line}\n")
-            f.write("if [ -f " + host_pid_file + " ]; then\n")
-            f.write("    pid=$(cat " + host_pid_file + ")\n")
-            f.write("    pkill -P $pid\n")
-            f.write("else\n")
-            # TODO: This is a temporary fix. We need to find a better way to stop the job.
-            f.write("    pkill -f 'torchrun'\n")
-            f.write("fi\n")
-            if node_rank == 0 and self.diagnostics_run_id != self.rdzv_id:
-                for line in active_run_id_cleanup_lines(
-                    self.active_run_id_file,
-                    self.diagnostics_run_id,
-                ):
-                    f.write(f"{line}\n")
+            f.write("(\n")
+            for line in stop_shell_lines(host_pid_file, self.config.experiment.runner):
+                f.write(f"{line}\n")
+            f.write(")\ntraining_stop_rc=$?\n")
+            for line in self.trace_config.stop_evidence_lines(node_rank, "worker_stop_finished"):
+                f.write(f"{line}\n")
+            # Trace cleanup happens at the launcher after every node confirms
+            # training exit. The normal wrapper publishes each node's seal.
+
+            f.write('[ "$training_stop_rc" -eq 0 ] || exit "$training_stop_rc"\n')
             f.write(f"{after_stop}\n")
             f.flush()
             os.fsync(f.fileno())
         os.chmod(host_stop_script_file, 0o755)
 
         return host_stop_script_file
+
+    def generate_trace_stop_script(self, host):
+        if not self.trace_config.enabled:
+            return None
+        # Stop creates a new backend; recover the monitor's launched budget.
+        trace = replace(self.trace_config, expected_nodes=1)
+        path = os.path.join(
+            self.config.train.system.logging.scripts_dir, f"host_0_{host}_trace_stop.sh"
+        )
+        with open(path, "w") as output:
+            output.write("#!/bin/bash\n" + "\n".join(trace.stop_shell_lines(0)) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        return path

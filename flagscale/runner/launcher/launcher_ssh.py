@@ -23,6 +23,7 @@ from datetime import datetime
 
 from omegaconf import DictConfig, OmegaConf
 
+from flagscale.runner.diagnostics import active_run_id_cleanup_lines
 from flagscale.runner.elastic.monitor_service import MonitorService
 from flagscale.runner.launcher.launcher_base import LauncherBase
 from flagscale.runner.utils import (
@@ -153,6 +154,8 @@ def _get_runner_cmd_train(
         del runner_args["heartbeat"]
     if "tracing" in runner_args:
         del runner_args["tracing"]
+    for key in ("stop_timeout_s", "stop_kill_timeout_s"):
+        runner_args.pop(key, None)
     runner_args["rdzv_id"] = rdzv_id
     # runner_args["master_addr"] = master_addr
     # runner_args["master_port"] = master_port
@@ -342,6 +345,16 @@ class SshLauncher(LauncherBase):
             logging_config = self.config.system.logging
         # todo: unify logging configs of all tasks
         if self.task_type == "train":
+            if getattr(self.backend, "trace_config", None) is not None:
+                from dataclasses import replace
+
+                self.backend.trace_config = replace(
+                    self.backend.trace_config,
+                    expected_nodes=nnodes,
+                    local_processes=nproc_per_node,
+                    peer_hosts=tuple(self.resources)[:nnodes] if self.resources else ("localhost",),
+                    ssh_port=int(self.config.experiment.runner.get("ssh_port", 22)),
+                )
             host_run_script_file = self.backend.generate_run_script(
                 self.config,
                 host,
@@ -586,13 +599,71 @@ class SshLauncher(LauncherBase):
                         host, host_stop_script_file, logging_config.scripts_dir, ssh_port
                     )
                 # Step 3: run the host_run_script_file on the remote host
-                run_ssh_command(host, f"bash {host_stop_script_file}", ssh_port)
+                # Wait for each node's final stop result before reporting success.
+                result = run_ssh_command(
+                    host,
+                    f"bash {shlex.quote(host_stop_script_file)}",
+                    ssh_port,
+                    background=False,
+                    query=True,
+                )
+                if result.returncode:
+                    raise RuntimeError(
+                        f"Training stop failed on {host}: {result.stderr}\n{result.stdout}"
+                    )
             else:
                 run_local_command(f"bash {host_stop_script_file}")
 
     def stop(self):
+        try:
+            return self._stop_training_and_diagnostics()
+        finally:
+            # Also bound diagnostics after a failed worker-stop attempt; retain
+            # its original exception and report evidence incompleteness separately.
+            try:
+                self._finish_trace_monitor()
+            except Exception as exc:
+                logger.error(f"Online Trace shutdown did not finish: {exc!r}")
+            # Preserve stop failure/return semantics; audit is independent and bounded.
+            try:
+                from flagscale.runner.tracing.final_evidence import launch_for_stopped_run
+
+                audit = launch_for_stopped_run(self)
+                if audit is not None:
+                    logger.info(f"Independent final evidence audit: {audit}")
+            except Exception as exc:
+                logger.error(
+                    f"Could not start final evidence audit; stop result is unchanged: {exc!r}"
+                )
+
+    def _finish_trace_monitor(self):
+        # All _stop_each acknowledgements have arrived. No node can still be
+        # delaying its workers behind diagnostic cleanup when this signal fires.
+        generate = getattr(self.backend, "generate_trace_stop_script", None)
+        if generate is None:
+            return
+        host = next(iter(self.resources)) if self.resources else "localhost"
+        script = generate(host)
+        if script is None:
+            return
+        command = "bash " + shlex.quote(script)
+        if host == "localhost":
+            run_local_command(command)
+        else:
+            result = run_ssh_command(
+                host,
+                command,
+                self.config.experiment.runner.get("ssh_port", 22),
+                background=False,
+                query=True,
+            )
+            if result.returncode:
+                raise RuntimeError(f"Trace shutdown failed on {host}: {result.stderr}")
+
+    def _stop_training_and_diagnostics(self):
         if self.resources is None or self.task_type == "serve":
             self._stop_each("localhost", 0)
+            self._clear_stopped_run()
             return
 
         nnodes = get_nnodes(len(self.resources), self.config.experiment.runner.get("nnodes", None))
@@ -621,6 +692,19 @@ class SshLauncher(LauncherBase):
                 if node_rank >= nnodes:
                     break
                 self._stop_each(host, node_rank)
+
+        self._clear_stopped_run()
+
+    def _clear_stopped_run(self):
+        # Every target must confirm exit before the controller clears active state.
+        if self.task_type == "train" and hasattr(self.backend, "active_run_id_file"):
+            run_local_command(
+                "\n".join(
+                    active_run_id_cleanup_lines(
+                        self.backend.active_run_id_file, self.backend.diagnostics_run_id
+                    )
+                )
+            )
 
     def _generate_query_script(self, host, node_rank):
         """Genetrate the query script for each host."""

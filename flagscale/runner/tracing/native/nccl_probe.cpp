@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#if defined(FLAGSCALE_TRACE_USE_RCCL)
+#include <rccl.h>
+using ProbeStream_t = hipStream_t;
+#else
 #include <nccl.h>
+using ProbeStream_t = cudaStream_t;
+#endif
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -343,6 +350,12 @@ class Runtime {
       file_path_ = trace_dir_ + "/rank_" + std::to_string(rank_) + "_pid_" +
                    std::to_string(static_cast<long long>(::getpid())) + ".jsonl";
       enabled_ = true;
+
+      // This process is the training rank selected by torchrun. Keep tracing active
+      // in the current process, but do not let later exec'd helpers inherit the
+      // activation flag. They also inherit RANK and LD_PRELOAD, and would otherwise
+      // create empty per-rank trace files even though they never call NCCL.
+      (void)::unsetenv("FLAGSCALE_TRACE_ENABLE");
       worker_ = std::thread(&Runtime::WorkerLoop, this);
     } catch (...) {
       // Tracing is diagnostic-only. Failure to allocate or start its worker must not
@@ -380,6 +393,9 @@ class Runtime {
     WriteEvent(fd, MakeProcessStart());
     WriteProbeStatus(fd, 0);
 
+    const auto sync_period = std::chrono::milliseconds(
+        std::max(1, env_int("FLAGSCALE_TRACE_SYNC_INTERVAL_MS", 1000)));
+    auto next_sync = std::chrono::steady_clock::now() + sync_period;
     std::vector<Event> batch;
     batch.reserve(kMaxBatchSize);
     uint64_t reported_drops = 0;
@@ -388,7 +404,7 @@ class Runtime {
       batch.clear();
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this] { return queue_size_ > 0 || stopping_.load(); });
+        queue_cv_.wait_until(lock, next_sync, [this] { return queue_size_ > 0 || stopping_.load(); });
         while (queue_size_ > 0 && batch.size() < kMaxBatchSize) {
           batch.push_back(queue_[queue_head_]);
           queue_head_ = (queue_head_ + 1) % kQueueCapacity;
@@ -400,6 +416,11 @@ class Runtime {
       if (drops != reported_drops) {
         WriteProbeStatus(fd, drops);
         reported_drops = drops;
+      }
+      if (std::chrono::steady_clock::now() >= next_sync) {
+        if (write_errors_ || sync_errors_) WriteProbeStatus(fd, drops);
+        if (dirty_) Publish(fd);
+        next_sync = std::chrono::steady_clock::now() + sync_period;
       }
     }
 
@@ -416,8 +437,21 @@ class Runtime {
       if (batch.empty()) break;
       for (const Event& event : batch) WriteEvent(fd, event);
     }
-    ::fsync(fd);
+    Publish(fd);
     ::close(fd);
+  }
+
+  void Publish(int fd) {
+    int result;
+    do { result = ::fsync(fd); } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+      ++sync_errors_;
+      last_sync_errno_ = errno;
+      std::fprintf(stderr, "FlagScale trace fsync failed: errno=%d\n", last_sync_errno_);
+    } else {
+      dirty_ = false;
+      last_sync_errno_ = 0;
+    }
   }
 
   void WriteAll(int fd, const std::string& line) const {
@@ -426,7 +460,13 @@ class Runtime {
     while (remaining > 0) {
       const ssize_t written = ::write(fd, cursor, remaining);
       if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) return;
+      if (written <= 0) {
+        ++write_errors_;
+        last_write_errno_ = written < 0 ? errno : EIO;
+        std::fprintf(stderr, "FlagScale trace write failed: errno=%d\n", last_write_errno_);
+        return;
+      }
+      dirty_ = true;
       cursor += written;
       remaining -= static_cast<std::size_t>(written);
     }
@@ -451,6 +491,10 @@ class Runtime {
     const uint64_t mono_ns = clock_ns(CLOCK_MONOTONIC);
     std::string line = CommonJsonPrefix("probe_status", unix_ns, mono_ns);
     line += ",\"dropped_events\":" + std::to_string(dropped_events);
+    line += ",\"write_errors\":" + std::to_string(write_errors_);
+    line += ",\"sync_errors\":" + std::to_string(sync_errors_);
+    line += ",\"last_write_errno\":" + std::to_string(last_write_errno_);
+    line += ",\"last_sync_errno\":" + std::to_string(last_sync_errno_);
     line += "}\n";
     WriteAll(fd, line);
   }
@@ -497,6 +541,12 @@ class Runtime {
     WriteAll(fd, line);
   }
 
+  // Accessed exclusively by the background writer.
+  mutable bool dirty_ = false;
+  mutable uint64_t write_errors_ = 0;
+  mutable int last_write_errno_ = 0;
+  uint64_t sync_errors_ = 0;
+  int last_sync_errno_ = 0;
   bool enabled_ = false;
   int rank_ = -1;
   int local_rank_ = -1;
@@ -573,7 +623,7 @@ struct CallContext {
 
 CallContext BeginCall(const char* api, ncclComm_t comm, std::size_t count,
                       ncclDataType_t datatype, int op, int root, int peer,
-                      cudaStream_t stream, bool is_p2p = false) noexcept {
+                      ProbeStream_t stream, bool is_p2p = false) noexcept {
   try {
     Runtime& runtime = Runtime::Instance();
     Event event = MakeBaseEvent(EventKind::kNcclCall, api, "enter");
@@ -628,7 +678,7 @@ CallContext BeginCall(const char* api, ncclComm_t comm, std::size_t count,
 
 void EndCall(const char* api, const CallContext& context, ncclResult_t result,
              std::size_t count, ncclDataType_t datatype, int op, int root,
-             int peer, cudaStream_t stream) noexcept {
+             int peer, ProbeStream_t stream) noexcept {
   try {
     Runtime& runtime = Runtime::Instance();
     Event event = MakeBaseEvent(EventKind::kNcclCall, api, "exit");
@@ -689,15 +739,21 @@ Function LoadNext(const char* name) {
   void* symbol = ::dlsym(RTLD_NEXT, name);
   if (symbol != nullptr) return reinterpret_cast<Function>(symbol);
 
-  // PyTorch commonly opens its bundled NCCL with RTLD_LOCAL. Such symbols are not
+  // PyTorch commonly opens its bundled NCCL/RCCL with RTLD_LOCAL. Such symbols are not
   // visible through RTLD_NEXT even though libtorch can call our preloaded wrapper.
   // Resolve directly from the NCCL handle in that case.
   static void* nccl_handle = []() noexcept -> void* {
-    void* handle = ::dlopen("libnccl.so.2", RTLD_LAZY | RTLD_NOLOAD);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so.2", RTLD_LAZY | RTLD_LOCAL);
-    if (handle == nullptr) handle = ::dlopen("libnccl.so", RTLD_LAZY | RTLD_LOCAL);
-    return handle;
+#if defined(FLAGSCALE_TRACE_USE_RCCL)
+    const char* libraries[] = {"librccl.so.1", "librccl.so"};
+#else
+    const char* libraries[] = {"libnccl.so.2", "libnccl.so"};
+#endif
+    for (const int flags : {RTLD_LAZY | RTLD_NOLOAD, RTLD_LAZY | RTLD_LOCAL}) {
+      for (const char* library : libraries) {
+        if (void* handle = ::dlopen(library, flags)) return handle;
+      }
+    }
+    return nullptr;
   }();
   if (nccl_handle == nullptr) return nullptr;
   return reinterpret_cast<Function>(::dlsym(nccl_handle, name));
@@ -792,9 +848,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclCommDestroy(ncclComm_t comm) {
 FLAGSCALE_EXPORT ncclResult_t ncclAllReduce(const void* send_buffer, void* receive_buffer,
                                             size_t count, ncclDataType_t datatype,
                                             ncclRedOp_t op, ncclComm_t comm,
-                                            cudaStream_t stream) {
+                                            ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclAllReduce");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclAllReduce", comm, count, datatype,
@@ -809,9 +865,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclAllReduce(const void* send_buffer, void* recei
 
 FLAGSCALE_EXPORT ncclResult_t ncclAllGather(const void* send_buffer, void* receive_buffer,
                                             size_t send_count, ncclDataType_t datatype,
-                                            ncclComm_t comm, cudaStream_t stream) {
+                                            ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclComm_t, cudaStream_t);
+                                    ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclAllGather");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =
@@ -827,9 +883,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclAllGather(const void* send_buffer, void* recei
 FLAGSCALE_EXPORT ncclResult_t ncclReduceScatter(const void* send_buffer,
                                                 void* receive_buffer, size_t receive_count,
                                                 ncclDataType_t datatype, ncclRedOp_t op,
-                                                ncclComm_t comm, cudaStream_t stream) {
+                                                ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclReduceScatter");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclReduceScatter", comm, receive_count,
@@ -844,9 +900,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclReduceScatter(const void* send_buffer,
 
 FLAGSCALE_EXPORT ncclResult_t ncclBroadcast(const void* send_buffer, void* receive_buffer,
                                             size_t count, ncclDataType_t datatype, int root,
-                                            ncclComm_t comm, cudaStream_t stream) {
+                                            ncclComm_t comm, ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, int,
-                                    ncclComm_t, cudaStream_t);
+                                    ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclBroadcast");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =
@@ -861,9 +917,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclBroadcast(const void* send_buffer, void* recei
 FLAGSCALE_EXPORT ncclResult_t ncclReduce(const void* send_buffer, void* receive_buffer,
                                          size_t count, ncclDataType_t datatype,
                                          ncclRedOp_t op, int root, ncclComm_t comm,
-                                         cudaStream_t stream) {
+                                         ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t,
-                                    ncclRedOp_t, int, ncclComm_t, cudaStream_t);
+                                    ncclRedOp_t, int, ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclReduce");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context = BeginCall("ncclReduce", comm, count, datatype,
@@ -878,9 +934,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclReduce(const void* send_buffer, void* receive_
 
 FLAGSCALE_EXPORT ncclResult_t ncclSend(const void* send_buffer, size_t count,
                                        ncclDataType_t datatype, int peer, ncclComm_t comm,
-                                       cudaStream_t stream) {
+                                       ProbeStream_t stream) {
   using Function = ncclResult_t (*)(const void*, size_t, ncclDataType_t, int,
-                                    ncclComm_t, cudaStream_t);
+                                    ncclComm_t, ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclSend");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =
@@ -893,9 +949,9 @@ FLAGSCALE_EXPORT ncclResult_t ncclSend(const void* send_buffer, size_t count,
 
 FLAGSCALE_EXPORT ncclResult_t ncclRecv(void* receive_buffer, size_t count,
                                        ncclDataType_t datatype, int peer, ncclComm_t comm,
-                                       cudaStream_t stream) {
+                                       ProbeStream_t stream) {
   using Function = ncclResult_t (*)(void*, size_t, ncclDataType_t, int, ncclComm_t,
-                                    cudaStream_t);
+                                    ProbeStream_t);
   static Function real_function = LoadNext<Function>("ncclRecv");
   if (real_function == nullptr) return ncclInternalError;
   const CallContext context =

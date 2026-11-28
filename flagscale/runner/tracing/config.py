@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
+
+from flagscale.runner.diagnostics import stop_process_shell_lines
 
 _PROBE_LIBRARY_NAME = "libflagscale_nccl_probe.so"
 
@@ -77,9 +80,16 @@ class TraceLaunchConfig:
     missing_exit_timeout_s: float = 60.0
     failure_grace_period_s: float = 60.0
     scan_interval_s: float = 1.0
+    probe_sync_interval_s: float = 1.0
     monitor_nice: int = 10
     hardware_health_enabled: bool = False
     hardware_health_stale_after_s: float = 180.0
+    peer_hosts: tuple[str, ...] = ()
+    ssh_port: int = 22
+    expected_nodes: int = 0
+    local_processes: int = 0
+    training_state_file: str = ""
+    shutdown_timeout_s: float = 30.0
     inspector_enabled: bool = False
     inspector_plugin_library: str = ""
     inspector_bridge_library: str = ""
@@ -124,6 +134,7 @@ class TraceLaunchConfig:
             "  exit 1",
             "fi",
             "export FLAGSCALE_TRACE_ENABLE=1",
+            f"export FLAGSCALE_TRACE_SYNC_INTERVAL_MS={max(1, int(self.probe_sync_interval_s * 1000))}",
             f"export FLAGSCALE_TRACE_RUN_ID={shlex.quote(self.run_id)}",
             f"export FLAGSCALE_TRACE_DIR={qdir}",
             f'export LD_PRELOAD={qlib}"${{LD_PRELOAD:+:$LD_PRELOAD}}"',
@@ -207,6 +218,19 @@ class TraceLaunchConfig:
                 "--nice",
                 str(self.monitor_nice),
             ]
+            if self.expected_nodes:
+                monitor_cmd.extend(
+                    [
+                        "--expected-nodes",
+                        str(self.expected_nodes),
+                        "--shutdown-timeout",
+                        str(self.shutdown_timeout_s),
+                        "--peer-hosts",
+                        json.dumps(self.peer_hosts),
+                        "--ssh-port",
+                        str(self.ssh_port),
+                    ]
+                )
             if self.heartbeat_dir:
                 monitor_cmd.extend(
                     [
@@ -252,20 +276,70 @@ class TraceLaunchConfig:
 
     def command_exit_actions(self, node_rank: int) -> list[str]:
         """Return analyzer completion actions for a shared diagnostic wrapper."""
-        if not self.enabled or node_rank != 0:
+        if not self.enabled:
             return []
-        completion = shlex.quote(self.completion_file)
-        return [f"printf '%s\\n' \\$rc > {completion}"]
+        actions = self.publication_lines(node_rank)
+        if node_rank == 0:
+            completion = shlex.quote(self.completion_file)
+            actions.append(f"printf '%s\\n' \\$rc > {completion}")
+        return actions
 
     def stop_shell_lines(self, node_rank: int) -> list[str]:
         if not self.enabled or node_rank != 0:
             return []
-        pid_file = shlex.quote(self.monitor_pid_file)
-        return [
-            f"if [ -f {pid_file} ]; then",
-            f'    kill "$(cat {pid_file})" 2>/dev/null || true',
-            "fi",
+        return stop_process_shell_lines(
+            self.monitor_pid_file,
+            f"flagscale.runner.tracing.monitor --trace-dir {self.trace_dir}",
+            timeout_s=self.shutdown_timeout_s + 3 if self.expected_nodes else 5.0,
+        )
+
+    def publication_lines(self, node_rank: int) -> list[str]:
+        if not self.enabled or not self.training_state_file:
+            return []
+        command = [
+            "python3",
+            "-m",
+            "flagscale.runner.tracing.shutdown",
+            "publish",
+            "--trace-dir",
+            self.trace_dir,
+            "--run-id",
+            self.run_id,
+            "--node-rank",
+            str(node_rank),
+            "--nproc",
+            str(self.local_processes),
+            "--state-file",
+            self.training_state_file,
         ]
+        if self.inspector_enabled:
+            command += ["--inspector-dir", self.inspector_dump_dir]
+        if self.inspector_bridge_library:
+            command.append("--bridge")
+        # This publisher never waits for another node or the monitor.
+        return ["timeout --kill-after=1s 5s " + shlex.join(command) + " || true"]
+
+    def stop_evidence_lines(self, node_rank: int, event: str) -> list[str]:
+        if not self.enabled:
+            return []
+        command = [
+            "python3",
+            str(Path(__file__).with_name("stop_evidence.py")),
+            "--directory",
+            self.trace_dir,
+            "--run-id",
+            self.run_id,
+            "--node-rank",
+            str(node_rank),
+            "--event",
+            event,
+        ]
+        line = "timeout --kill-after=1s 1s " + shlex.join(command)
+        if event == "worker_signal_result":
+            line += ' --result "$diagnostics_signal_rc"'
+        if event == "worker_stop_finished":
+            line += ' --result "$training_stop_rc"'
+        return [line + " || true"]
 
 
 def _default_probe_path() -> str:
@@ -426,6 +500,9 @@ def prepare_trace_launch_config(
         missing_exit_timeout_s=missing_exit_timeout_s,
         failure_grace_period_s=failure_grace_period_s,
         scan_interval_s=_positive_float(raw_dict.get("scan_interval_s", 1.0), "scan_interval_s"),
+        probe_sync_interval_s=_positive_float(
+            raw_dict.get("probe_sync_interval_s", 1.0), "probe_sync_interval_s"
+        ),
         monitor_nice=monitor_nice,
         hardware_health_enabled=bool(
             heartbeat_config is not None

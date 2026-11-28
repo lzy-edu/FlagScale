@@ -22,6 +22,7 @@ from flagscale.runner.diagnostics import diagnostic_command_body
 from flagscale.runner.heartbeat.config import prepare_heartbeat_launch_config
 from flagscale.runner.runner_train import _get_args_native, _update_config_train
 from flagscale.runner.tracing.config import prepare_trace_launch_config
+from flagscale.runner.training_process import stop_shell_lines, tracked_command_body
 from flagscale.runner.utils import get_pkg_dir, logger, parse_hostfile, resolve_path
 
 
@@ -136,6 +137,7 @@ class NativeTrainBackend(BackendBase):
             command_body = diagnostic_command_body(
                 node_rank, self.heartbeat_config, self.trace_config
             )
+            command_body = tracked_command_body(command_body, host_pid_file)
             if background:
                 f.write(
                     f'nohup bash -c "{command_body}" >> {host_output_file} 2>&1 & echo $! > {host_pid_file}\n'
@@ -171,17 +173,19 @@ class NativeTrainBackend(BackendBase):
             after_stop = ""
         with open(host_stop_script_file, "w") as f:
             f.write("#!/bin/bash\n\n")
-            f.write("if [ -f " + host_pid_file + " ]; then\n")
-            f.write("    pid=$(cat " + host_pid_file + ")\n")
-            f.write("    pkill -P $pid\n")
-            f.write("else\n")
-            # TODO: This is a temporary fix. We need to find a better way to stop the job.
-            f.write("    pkill -f 'torchrun'\n")
-            f.write("fi\n")
+            for line in self.trace_config.stop_evidence_lines(node_rank, "worker_stop_started"):
+                f.write(f"{line}\n")
+            f.write("(\n")
+            for line in stop_shell_lines(host_pid_file, self.config.experiment.runner):
+                f.write(f"{line}\n")
+            f.write(")\ntraining_stop_rc=$?\n")
+            for line in self.trace_config.stop_evidence_lines(node_rank, "worker_stop_finished"):
+                f.write(f"{line}\n")
             for line in self.heartbeat_config.stop_shell_lines(node_rank):
                 f.write(f"{line}\n")
             for line in self.trace_config.stop_shell_lines(node_rank):
                 f.write(f"{line}\n")
+            f.write('[ "$training_stop_rc" -eq 0 ] || exit "$training_stop_rc"\n')
             f.write(f"{after_stop}\n")
             f.flush()
             os.fsync(f.fileno())

@@ -41,6 +41,12 @@ class InspectorStore:
             CREATE INDEX bridge_call ON records(kind,host,pid,token,call);
             CREATE INDEX legacy_seq ON records(kind,host,pid,rank,api,seq,comm);
             CREATE INDEX legacy_time ON records(kind,host,pid,rank,api,stamp);
+            CREATE TABLE latest_tasks (
+              host TEXT, pid INTEGER, token INTEGER, task INTEGER, revision INTEGER,
+              covered INTEGER, body TEXT,
+              PRIMARY KEY(host,pid,token,task)
+            );
+            CREATE INDEX incomplete_tasks ON latest_tasks(covered);
         """)
         self.lookup_bytes = lookup_bytes
 
@@ -83,6 +89,53 @@ class InspectorStore:
             "INSERT OR IGNORE INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (digest, *fields, body),
         )
+        if kind == "flagscale_profiler_v5_v1":
+            channels = payload.get("channels")
+            covered = (
+                isinstance(channels, list)
+                and len(channels) == _as_int(payload.get("expected_channels")) > 0
+                and all(
+                    isinstance(ch, dict) and _as_int(ch.get("end")) >= _as_int(ch.get("begin")) > 0
+                    for ch in channels
+                )
+            )
+            # This is a shutdown inventory only. for_event() still checks ALL
+            # revisions and conflicts, never just the latest task row.
+            self.db.execute(
+                """
+                INSERT INTO latest_tasks VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(host,pid,token,task) DO UPDATE SET
+                  revision=excluded.revision, covered=excluded.covered, body=excluded.body
+                WHERE excluded.revision >= latest_tasks.revision
+            """,
+                (
+                    fields[1],
+                    fields[2],
+                    fields[3],
+                    _as_int(payload.get("task_id")),
+                    _as_int(payload.get("revision")),
+                    int(covered),
+                    body,
+                ),
+            )
+
+    def incomplete_inventory(self, limit=256):
+        total = self.db.execute("SELECT count(*) FROM latest_tasks WHERE covered=0").fetchone()[0]
+        rows = []
+        size = 0
+        for (body,) in self.db.execute(
+            "SELECT body FROM latest_tasks WHERE covered=0 LIMIT ?", (limit,)
+        ):
+            size += len(body.encode())
+            if size > self.lookup_bytes:
+                break
+            rows.append(json.loads(body))
+        return {
+            "incomplete_latest_record_count": total,
+            "records": rows,
+            "truncated": len(rows) < total,
+            "meaning": "latest_channel_coverage_only_not_failure_verdict",
+        }
 
     def _rows(self, where, params):
         total = 0
