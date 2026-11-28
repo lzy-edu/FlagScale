@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "profiler.h"
+#include "retention_socket.h"
 
 namespace {
 using Getter = uint64_t (*)(const char*, uint64_t, uint64_t*);
@@ -73,6 +74,7 @@ constexpr uintptr_t kApiTag = uintptr_t{1} << 63;
 constexpr uintptr_t kCapturedTag = uintptr_t{1} << 62;
 constexpr uintptr_t kCallMask = kCapturedTag - 1;
 bool broken = false;
+bool streaming = false;
 char hostname[256] = {};
 // Bound only live task/channel/delegate events. API identities are immutable
 // integer tokens, never dereferenced, and do not allocate retained objects.
@@ -153,7 +155,8 @@ bool write_all(int fd, const std::string& line) {
   const char* cursor = line.data();
   size_t remaining = line.size();
   while (remaining) {
-    const ssize_t written = ::write(fd, cursor, remaining);
+    const ssize_t written = streaming ? ::send(fd, cursor, remaining, MSG_NOSIGNAL)
+                                      : ::write(fd, cursor, remaining);
     if (written < 0 && errno == EINTR) continue;
     if (written <= 0) return false;
     cursor += written;
@@ -220,12 +223,14 @@ ncclResult_t init(void** context, uint64_t comm, int* mask, const char* name,
                   int nodes, int ranks, int rank, ncclDebugLogger_t logger) {
   std::lock_guard<std::mutex> guard(mutex);
   try {
-    if (!delegate) {
+    if (bridge.fd < 0) {
+      const char* socket = flagscale_trace::collector_path();
+      streaming = socket != nullptr;
       const char* path = std::getenv("FLAGSCALE_INSPECTOR_DELEGATE");
-      void* lib = path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : nullptr;
+      void* lib = path && !streaming ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : nullptr;
       delegate = lib ? static_cast<ncclProfiler_v5_t*>(dlsym(lib, "ncclProfiler_v5")) : nullptr;
       getter = reinterpret_cast<Getter>(dlsym(RTLD_DEFAULT, "flagscale_trace_profiler_call_v1"));
-      if (!delegate || delegate->init == init || !getter) {
+      if ((!streaming && (!delegate || delegate->init == init)) || !getter) {
         delegate = nullptr;
         *mask = 0; *context = nullptr; return ncclSuccess;
       }
@@ -233,7 +238,7 @@ ncclResult_t init(void** context, uint64_t comm, int* mask, const char* name,
       const char* dir = std::getenv("NCCL_INSPECTOR_DUMP_DIR");
       if (!dir) { *mask = 0; *context = nullptr; return ncclSuccess; }
       std::string file = std::string(dir) + "/bridge-" + hostname + "-" + std::to_string(getpid()) + ".jsonl";
-      bridge.fd = ::open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+      bridge.fd = streaming ? flagscale_trace::connect_collector(socket) : ::open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
       if (bridge.fd < 0) { delegate = nullptr; *mask = 0; *context = nullptr; return ncclSuccess; }
       Dl_info library{};
       if (!dladdr(reinterpret_cast<void*>(publish), &library) ||
@@ -254,7 +259,9 @@ ncclResult_t init(void** context, uint64_t comm, int* mask, const char* name,
     }
     auto c = std::make_unique<Context>();
     c->comm = comm; c->rank = rank; c->ranks = ranks;
-    auto result = delegate->init(&c->delegate, comm, mask, name, nodes, ranks, rank, logger);
+    if (!delegate) *mask = 0;
+    auto result = delegate ? delegate->init(&c->delegate, comm, mask, name, nodes, ranks, rank, logger)
+                           : ncclSuccess;
     if (result != ncclSuccess) return result;
     *mask |= ncclProfileCollApi | ncclProfileP2pApi | ncclProfileColl |
              ncclProfileP2p | ncclProfileKernelCh;
@@ -324,7 +331,7 @@ ncclResult_t start(void* context, void** handle, ncclProfilerEventDescr_v5_t* de
       if (e->type == ncclProfileP2p) forwarded.p2p.parentGroup = original(descr->p2p.parentGroup);
       // The delegate may not implement P2P. Never pass a null P2P parent to
       // its channel callback; the bridge still collects that channel itself.
-      if (e->type != ncclProfileKernelCh || forwarded.parentObj) {
+      if (delegate && (e->type != ncclProfileKernelCh || forwarded.parentObj)) {
         auto result = delegate->startEvent(e->context->delegate, &e->delegate, &forwarded);
         if (result != ncclSuccess) return result;
       }
@@ -371,7 +378,7 @@ ncclResult_t finalize(void* context) {
   if (!context) return ncclSuccess;
   auto c = static_cast<Context*>(context);
   // Delegate finalization may wait for callbacks; do not hold our mutex here.
-  auto result = delegate->finalize(c->delegate);
+  auto result = delegate ? delegate->finalize(c->delegate) : ncclSuccess;
   std::unique_lock<std::mutex> guard(mutex);
   try {
     size_t incomplete = 0;

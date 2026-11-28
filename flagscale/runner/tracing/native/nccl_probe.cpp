@@ -41,6 +41,7 @@ using ProbeStream_t = cudaStream_t;
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include "retention_socket.h"
 
 namespace flagscale::tracing {
 
@@ -388,8 +389,14 @@ class Runtime {
   }
 
   void WorkerLoopImpl() {
-    const int fd = ::open(file_path_.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0) return;
+    const char* socket = flagscale_trace::collector_path();
+    streaming_ = socket != nullptr;
+    const int fd = streaming_ ? flagscale_trace::connect_collector(socket)
+                              : ::open(file_path_.c_str(), O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      std::fprintf(stderr, "FlagScale trace source unavailable: errno=%d\n", errno);
+      return;
+    }
     WriteEvent(fd, MakeProcessStart());
     WriteProbeStatus(fd, 0);
 
@@ -442,6 +449,7 @@ class Runtime {
   }
 
   void Publish(int fd) {
+    if (streaming_) { dirty_ = false; return; }
     int result;
     do { result = ::fsync(fd); } while (result < 0 && errno == EINTR);
     if (result < 0) {
@@ -455,10 +463,14 @@ class Runtime {
   }
 
   void WriteAll(int fd, const std::string& line) const {
+    // A Unix stream cannot be resumed after a partial record. Report its first
+    // failure once; repeated logging here would flood training stderr.
+    if (streaming_ && write_errors_ != 0) return;
     const char* cursor = line.data();
     std::size_t remaining = line.size();
     while (remaining > 0) {
-      const ssize_t written = ::write(fd, cursor, remaining);
+      const ssize_t written = streaming_ ? ::send(fd, cursor, remaining, MSG_NOSIGNAL)
+                                         : ::write(fd, cursor, remaining);
       if (written < 0 && errno == EINTR) continue;
       if (written <= 0) {
         ++write_errors_;
@@ -542,6 +554,7 @@ class Runtime {
   }
 
   // Accessed exclusively by the background writer.
+  bool streaming_ = false;
   mutable bool dirty_ = false;
   mutable uint64_t write_errors_ = 0;
   mutable int last_write_errno_ = 0;

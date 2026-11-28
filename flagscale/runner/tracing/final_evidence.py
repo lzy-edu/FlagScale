@@ -206,7 +206,9 @@ def audit_snapshots(request, manifests, directory, deadline=None, progress=None)
         for entry in manifest.get("files", []):
             try:
                 if progress:
-                    progress("verifying_file", file=Path(entry["path"]).name, verified_files=len(copied))
+                    progress(
+                        "verifying_file", file=Path(entry["path"]).name, verified_files=len(copied)
+                    )
                 total += entry["size"]
                 if total > MAX_BYTES:
                     raise ValueError("snapshot_total_budget_exceeded")
@@ -229,7 +231,11 @@ def audit_snapshots(request, manifests, directory, deadline=None, progress=None)
     ):
         index = reader.poll()
         if progress and time.monotonic() - last_update >= 5:
-            progress("reading_inspector", verified_files=len(copied), bytes_read=reader.diagnostics["read_bytes"])
+            progress(
+                "reading_inspector",
+                verified_files=len(copied),
+                bytes_read=reader.diagnostics["read_bytes"],
+            )
             last_update = time.monotonic()
     if request.get("inspector_dir") and not index.caught_up:
         errors.append(
@@ -266,7 +272,10 @@ def audit_snapshots(request, manifests, directory, deadline=None, progress=None)
                     raise TimeoutError("final_audit_deadline")
                 if progress and lines_read % 1000 == 0 and now - last_update >= 5:
                     progress(
-                        "matching_probe_calls", file=path.name, verified_files=len(copied), lines_read=lines_read
+                        "matching_probe_calls",
+                        file=path.name,
+                        verified_files=len(copied),
+                        lines_read=lines_read,
                     )
                     last_update = now
                 if (
@@ -338,6 +347,7 @@ def run_audit(request, output):
         "nodes": [],
         "errors": [],
     }
+
     def progress(stage, **details):
         report["progress"] = {"stage": stage, "updated_unix_ns": time.time_ns(), **details}
         write_json(output, report)
@@ -346,7 +356,9 @@ def run_audit(request, output):
 
     progress("starting")
     for node in request["nodes"]:
-        progress("waiting_for_node", node_rank=node["node_rank"], nodes_collected=len(report["nodes"]))
+        progress(
+            "waiting_for_node", node_rank=node["node_rank"], nodes_collected=len(report["nodes"])
+        )
         try:
             command = [
                 sys.executable,
@@ -484,6 +496,10 @@ def launch_for_stopped_run(launcher):
     trace = getattr(launcher.backend, "trace_config", None)
     if launcher.task_type != "train" or not trace or not trace.enabled:
         return None
+    if getattr(trace, "retention_window_bytes", 0):
+        # The independently running recorders seal their windows and the monitor
+        # checks every producer cursor in retention/report.json.
+        return Path(trace.trace_dir) / "retention"
     from flagscale.runner.utils import get_nnodes, get_nproc_per_node, update_nodes_envs
 
     runner = launcher.config.experiment.runner

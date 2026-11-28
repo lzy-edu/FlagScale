@@ -248,7 +248,12 @@ def run_monitor(args: argparse.Namespace) -> int:
         p2p_match_window_s=args.p2p_match_window,
         missing_exit_timeout_s=args.missing_exit_timeout,
     )
-    trace_tailer = JsonlTailer(trace_dir)
+    live = None
+    if getattr(args, "retention_nodes", 0):
+        from .retention_monitor import LiveNodes
+
+        live = LiveNodes(trace_dir, args.run_id, args.retention_nodes, args.local_processes)
+    trace_tailer = live or JsonlTailer(trace_dir)
     tailers = [trace_tailer]
     if args.heartbeat_dir:
         tailers.append(JsonlTailer(Path(args.heartbeat_dir)))
@@ -260,7 +265,7 @@ def run_monitor(args: argparse.Namespace) -> int:
     )
     inspector_reader = InspectorReader(
         Path(args.inspector_dir) if args.inspector_dir else trace_dir / "inspector",
-        enabled=bool(args.inspector_dir),
+        enabled=bool(args.inspector_dir) and live is None,
         correlation_window_s=args.inspector_correlation_window,
     )
     stopping = False
@@ -288,7 +293,7 @@ def run_monitor(args: argparse.Namespace) -> int:
 
             scan_unix_ns = time.time_ns()
             hardware_health, _hardware_findings = hardware_reader.poll(scan_unix_ns)
-            inspector = inspector_reader.poll()
+            inspector = live or inspector_reader.poll()
             findings = analyzer.scan(
                 now_monotonic_s=time.monotonic(),
                 now_unix_ns=scan_unix_ns,
@@ -297,6 +302,8 @@ def run_monitor(args: argparse.Namespace) -> int:
                 trace_source_issues=trace_tailer.source_issues(),
             )
             if not stopping and not (trace_dir / "stop.requested").exists():
+                if live and findings:
+                    live.freeze()
                 _append_findings(output, findings)
 
             exit_code = _completion_exit_code(completion_file)
@@ -315,7 +322,13 @@ def run_monitor(args: argparse.Namespace) -> int:
                 >= args.failure_grace_period
             )
             all_nodes_sealed = False
-            if getattr(args, "expected_nodes", 0):
+            if live:
+                all_nodes_sealed = all(
+                    live.statuses.get(i, {}).get("sealed")
+                    or (live.shared / f"node-{i}.final.json").exists()
+                    for i in range(live.count)
+                )
+            elif getattr(args, "expected_nodes", 0):
                 from .shutdown import load_seals
 
                 seals, missing_nodes, _ = load_seals(trace_dir, args.run_id, args.expected_nodes)
@@ -340,7 +353,7 @@ def run_monitor(args: argparse.Namespace) -> int:
                     now_monotonic_s=time.monotonic(),
                     now_unix_ns=final_unix_ns,
                     hardware_health=final_hardware_health,
-                    inspector=inspector_reader.poll(),
+                    inspector=live or inspector_reader.poll(),
                     trace_source_issues=trace_tailer.source_issues(),
                 )
                 if not stopping and not (trace_dir / "stop.requested").exists():
@@ -348,6 +361,20 @@ def run_monitor(args: argparse.Namespace) -> int:
                 stop_reason = "training_complete" if exit_code == 0 else "failure_grace_elapsed"
                 break
             time.sleep(args.scan_interval)
+        if live:
+            result = live.finish(analyzer, args.shutdown_timeout)
+            _append_findings(
+                output,
+                analyzer.scan(
+                    now_monotonic_s=time.monotonic(),
+                    now_unix_ns=time.time_ns(),
+                    hardware_health=hardware_reader.poll(time.time_ns())[0],
+                    inspector=live,
+                    trace_source_issues=live.source_issues(),
+                ),
+            )
+            live.acknowledge()
+            return 0 if result["status"] == "complete" else 2
         _drain_forensics(
             trace_dir,
             args.run_id,
@@ -370,7 +397,7 @@ def run_monitor(args: argparse.Namespace) -> int:
                     now_monotonic_s=time.monotonic(),
                     now_unix_ns=final_unix_ns,
                     hardware_health=final_health,
-                    inspector=inspector_reader.poll(),
+                    inspector=live or inspector_reader.poll(),
                     trace_source_issues=trace_tailer.source_issues(),
                 ),
             )
@@ -399,6 +426,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inspector-dir")
     parser.add_argument("--inspector-correlation-window", type=float, default=5.0)
     parser.add_argument("--drain-timeout", type=float, default=2.0)
+    parser.add_argument("--retention-nodes", type=int, default=0)
+    parser.add_argument("--local-processes", type=int, default=0)
     parser.add_argument("--expected-nodes", type=int, default=0)
     parser.add_argument("--peer-hosts", default="[]")
     parser.add_argument("--ssh-port", type=int, default=22)

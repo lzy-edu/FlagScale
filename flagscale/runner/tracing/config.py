@@ -90,6 +90,7 @@ class TraceLaunchConfig:
     local_processes: int = 0
     training_state_file: str = ""
     shutdown_timeout_s: float = 30.0
+    retention_window_bytes: int = 0
     inspector_enabled: bool = False
     inspector_plugin_library: str = ""
     inspector_bridge_library: str = ""
@@ -185,6 +186,38 @@ class TraceLaunchConfig:
         else:
             lines.append("unset FLAGSCALE_TRACE_PROFILER_BRIDGE")
 
+        if self.retention_window_bytes:
+            from .retention_node import socket_path
+
+            node_socket = socket_path(self.trace_dir, self.run_id, node_rank)
+            local_host = self.peer_hosts[node_rank] if self.peer_hosts else "127.0.0.1"
+            command = [
+                "python",
+                "-m",
+                "flagscale.runner.tracing.retention_node",
+                "--directory",
+                self.trace_dir,
+                "--run-id",
+                self.run_id,
+                "--node",
+                str(node_rank),
+                "--bind",
+                local_host,
+                "--window-bytes",
+                str(self.retention_window_bytes),
+            ]
+            shared = os.path.join(self.trace_dir, "retention")
+            ready = shlex.quote(os.path.join(shared, f"node-{node_rank}.endpoint"))
+            lines += [
+                f"LC_ALL=C grep -aqF FLAGSCALE_TRACE_COLLECTOR_SOCKET {qlib} || {{ echo 'Probe lacks bounded recorder support' >&2; exit 1; }}",
+                f"LC_ALL=C grep -aqF FLAGSCALE_TRACE_COLLECTOR_SOCKET {bridge_library} || {{ echo 'Profiler bridge lacks bounded recorder support' >&2; exit 1; }}",
+                f"mkdir -p -m 700 {shlex.quote(shared)}",
+                f"nohup {shlex.join(command)} > {shlex.quote(os.path.join(shared, f'node-{node_rank}.log'))} 2>&1 &",
+                f"for i in {{1..100}}; do test -S {shlex.quote(str(node_socket))} && test -s {ready} && break; sleep 0.1; done",
+                f"test -S {shlex.quote(str(node_socket))} || exit 1",
+                f"test -s {ready} || exit 1",
+                f"export FLAGSCALE_TRACE_COLLECTOR_SOCKET={shlex.quote(str(node_socket))}",
+            ]
         # With a shared trace directory, a single analyzer on node zero sees all ranks.
         if node_rank == 0:
             monitor_cmd = [
@@ -218,7 +251,18 @@ class TraceLaunchConfig:
                 "--nice",
                 str(self.monitor_nice),
             ]
-            if self.expected_nodes:
+            if self.retention_window_bytes:
+                monitor_cmd.extend(
+                    [
+                        "--retention-nodes",
+                        str(self.expected_nodes or 1),
+                        "--local-processes",
+                        str(self.local_processes),
+                        "--shutdown-timeout",
+                        str(self.shutdown_timeout_s),
+                    ]
+                )
+            elif self.expected_nodes:
                 monitor_cmd.extend(
                     [
                         "--expected-nodes",
@@ -294,6 +338,12 @@ class TraceLaunchConfig:
         )
 
     def publication_lines(self, node_rank: int) -> list[str]:
+        if self.enabled and self.retention_window_bytes:
+            marker = os.path.join(self.trace_dir, "retention", f"seal-{node_rank}")
+            from .retention_node import socket_path
+
+            local = socket_path(self.trace_dir, self.run_id, node_rank).with_suffix(".seal")
+            return [f"touch {shlex.quote(str(local))} {shlex.quote(marker)}"]
         if not self.enabled or not self.training_state_file:
             return []
         command = [
@@ -339,7 +389,16 @@ class TraceLaunchConfig:
             line += ' --result "$diagnostics_signal_rc"'
         if event == "worker_stop_finished":
             line += ' --result "$training_stop_rc"'
-        return [line + " || true"]
+        lines = [line + " || true"]
+        if self.retention_window_bytes and event == "worker_stop_finished":
+            marker = shlex.quote(os.path.join(self.trace_dir, "retention", f"seal-{node_rank}"))
+            from .retention_node import socket_path
+
+            local = socket_path(self.trace_dir, self.run_id, node_rank).with_suffix(".seal")
+            lines.append(
+                f'if [ "$training_stop_rc" -eq 0 ]; then touch {shlex.quote(str(local))} {marker}; fi'
+            )
+        return lines
 
 
 def _default_probe_path() -> str:
@@ -443,6 +502,11 @@ def prepare_trace_launch_config(
     if not isinstance(inspector, dict):
         raise ValueError("tracing.inspector must be a mapping")
     inspector_enabled = _bool(inspector.get("enabled", False), "inspector.enabled")
+    retention_window_bytes = _non_negative_int(
+        raw_dict.get("retention_window_bytes", 0), "retention_window_bytes"
+    )
+    if retention_window_bytes and not (inspector_enabled and inspector.get("bridge_library")):
+        raise ValueError("Bounded trace retention requires the NVIDIA Profiler bridge")
     inspector_plugin_library = str(
         inspector.get("plugin_library") or os.getenv("NCCL_PROFILER_PLUGIN") or ""
     )
@@ -514,6 +578,7 @@ def prepare_trace_launch_config(
             if heartbeat_config is not None and heartbeat_config.enabled
             else 180.0
         ),
+        retention_window_bytes=retention_window_bytes,
         inspector_enabled=inspector_enabled,
         inspector_plugin_library=inspector_plugin_library,
         inspector_bridge_library=inspector_bridge_library,
